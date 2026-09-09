@@ -1466,7 +1466,7 @@ Panel {
     root.updateRunnerPath = String(Qt.resolvedUrl("update-helper.sh")).replace(/^file:\/\//, "")
     root.inventoryHelperPath = String(Qt.resolvedUrl("plugin-inventory.sh")).replace(/^file:\/\//, "")
     refreshPlugins()
-    fetchMarketplace()
+    // fetchMarketplace()
     Qt.callLater(function() { updateStatusFile.reload() })
   }
 

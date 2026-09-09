@@ -13,10 +13,10 @@ import "panel/plugin" as Plugin
 import "panel/updates" as Updates
 
 // Plugin manager popup: lists every discovered plugin (first-party omarchy +
-// third-party) with an enable/disable switch. The list is read from the
-// shell's PluginRegistry, which already scans manifests, so there is no
-// duplicate file IO — toggling routes through registry.setEnabled, the same
-// path `omarchy plugin enable/disable` uses.
+// third-party) with an enable/disable switch. Since Omarchy 4.0.3 sandboxed
+// third-party plugins, the list comes from plugin-inventory.sh rather than the
+// shell's PluginRegistry, and toggling routes through the `omarchy-shell shell`
+// IPC target — the same path `omarchy plugin enable/disable` uses.
 Panel {
   id: root
   moduleName: "omaplug"
@@ -37,12 +37,24 @@ Panel {
   property var pluginRows: []
   property var rememberedBarStates: ({})
 
-  // The shell injects the PluginRegistry into the bar's `shell` (the built-in
-  // Bar.qml exposes no `pluginRegistry` property itself), so resolve it there
-  // with a fallback for custom bars that do carry the registry directly.
-  readonly property var registry: root.bar && root.bar.shell
-    ? root.bar.shell.pluginRegistry
-    : (root.bar ? root.bar.pluginRegistry : null)
+  // Omarchy 4.0.3 moved third-party plugins behind capability-scoped facades.
+  // The injected `bar` is a PluginBarApi carrying neither a shell nor a
+  // registry, and the PluginRegistryApi a plugin can otherwise reach reports
+  // only itself, so enumerating plugins from inside QML is no longer possible.
+  // The panel reads the full picture from outside the sandbox instead, over
+  // the documented `omarchy-shell shell` IPC contract (shell/README.md).
+  //
+  // `inventory` maps plugin id -> the row emitted by plugin-inventory.sh.
+  property var inventory: ({})
+  property int inventoryRevision: 0
+  property bool inventoryLoading: false
+  property string inventoryHelperPath: ""
+
+  // omaplug is installed in the plugins directory it manages, so derive that
+  // path from our own location rather than from a registry we cannot reach.
+  readonly property string pluginDir: String(Qt.resolvedUrl("."))
+    .replace(/^file:\/\//, "").replace(/\/+$/, "")
+  readonly property string pluginsDir: root.pluginDir.substring(0, root.pluginDir.lastIndexOf("/"))
 
   // Git remote URLs for updatable plugins, keyed by sourceKey. Filled by a
   // background `git remote get-url` scan so each row can offer a repo link.
@@ -67,9 +79,8 @@ Panel {
     return root.marketplaceMap[String(id)] || null
   }
   function modelData_firstParty(id) {
-    var reg = root.registry
-    var m = reg && reg.installedPlugins ? reg.installedPlugins[id] : null
-    return m ? m.__isFirstParty === true : false
+    var m = root.inventory[String(id)]
+    return m ? m.firstParty === true : false
   }
   // GitHub compare URL from the listing's snapshot-checked commit to the
   // locally installed commit. Only http(s) GitHub remotes are eligible, since
@@ -499,8 +510,7 @@ Panel {
   // folder name) so each row can offer a repo link and compare its installed
   // code against the marketplace listing snapshot.
   function scanPluginRepos() {
-    var reg = root.registry
-    var dir = reg && reg.pluginsDir ? reg.pluginsDir : ""
+    var dir = root.pluginsDir
     if (!dir || root.reposScanning) return
     root.reposScanning = true
     var script = ""
@@ -563,8 +573,7 @@ Panel {
   // The script echoes a CHECK line before each plugin so the updates page can
   // show per-plugin progress while the fetch runs, then the result line.
   function checkUpdates() {
-    var reg = root.registry
-    var dir = reg && reg.pluginsDir ? reg.pluginsDir : ""
+    var dir = root.pluginsDir
     if (!dir || root.updateHelperPath === "" || root.checkingUpdates || root.updateDetachedRunning) return
     root.checkingUpdates = true
     root.updateSummary = ""
@@ -1223,21 +1232,50 @@ Panel {
     }
   }
 
+  // Asks plugin-inventory.sh for the current plugin set. The rows land in
+  // applyInventory(); every caller of refreshPlugins() only needs the refresh
+  // to happen, not to have finished when the call returns.
   function refreshPlugins() {
-    var reg = root.registry
-    if (!reg || !reg.installedPlugins) {
-      pluginRows = []
+    if (root.inventoryHelperPath === "" || root.inventoryLoading) return
+    root.inventoryLoading = true
+    inventoryProcess.command = [root.inventoryHelperPath, root.pluginsDir]
+    inventoryProcess.running = true
+  }
+
+  property Process inventoryProcess: Process {
+    onExited: function(exitCode) {
+      root.inventoryLoading = false
+      if (exitCode !== 0) {
+        console.warn("omaplug: plugin inventory failed, exit code:", exitCode)
+        return
+      }
+      root.applyInventory(inventoryStdout.text)
+    }
+    stdout: StdioCollector {
+      id: inventoryStdout
+      waitForEnd: true
+    }
+  }
+
+  function applyInventory(text) {
+    var listing = []
+    try {
+      listing = JSON.parse(String(text || "[]"))
+    } catch (e) {
+      console.warn("omaplug: could not parse plugin inventory:", e)
       return
     }
+    if (!Array.isArray(listing)) return
+
+    var map = ({})
     var rows = []
-    var pdir = (reg.pluginsDir || "").replace(/\/+$/, "") + "/"
-    for (var id in reg.installedPlugins) {
-      var m = reg.installedPlugins[id]
+    for (var i = 0; i < listing.length; i++) {
+      var m = listing[i]
       if (!m || typeof m !== "object") continue
-      var sourceDir = String(m.__sourceDir || "")
+      var id = String(m.id || "")
+      if (id === "") continue
+      map[id] = m
       var kinds = Array.isArray(m.kinds) ? m.kinds : []
-      var isBarOption = kinds.indexOf("bar") !== -1
-      var isBarWidget = kinds.indexOf("bar-widget") !== -1
       rows.push({
         id: id,
         name: m.name || id,
@@ -1245,11 +1283,11 @@ Panel {
         author: m.author || "",
         description: m.description || "",
         kinds: kinds.join(", "),
-        canDisable: !isBarOption,
-        firstParty: m.__isFirstParty === true,
-        sourceDir: sourceDir,
-        sourceKey: sourceDir.replace(/\/+$/, "").split("/").pop() || "",
-        updatable: sourceDir.indexOf(pdir) === 0
+        canDisable: m.canDisable !== false,
+        firstParty: m.firstParty === true,
+        sourceDir: String(m.sourceDir || ""),
+        sourceKey: String(m.sourceKey || ""),
+        updatable: m.updatable === true
       })
     }
     rows.sort(function(a, b) {
@@ -1258,15 +1296,21 @@ Panel {
       if (ka !== kb) return ka - kb
       return String(a.name).localeCompare(String(b.name))
     })
-    pluginRows = rows
+    root.inventory = map
+    root.pluginRows = rows
+    console.log("omaplug: inventory loaded, rows=", rows.length)
+    // Bumped last: the row delegates read enabled state through
+    // inventoryRevision, so it must change after the data it guards.
+    root.inventoryRevision++
+    root.invalidateGlyphCache()
+    root.drainPendingRestore()
     root.scanPluginRepos()
   }
 
   function barStateFor(id) {
-    var reg = root.registry
-    var config = reg && typeof reg.shellConfigProvider === "function"
-      ? reg.shellConfigProvider()
-      : null
+    // `omarchy bar` persists the widget layout to shell.json, which is the
+    // same state the registry's config provider used to hand back.
+    var config = root.shellConfig()
     var layout = config && config.bar ? config.bar.layout : null
     if (!layout) return null
     var sections = ["left", "center", "right"]
@@ -1275,9 +1319,7 @@ Panel {
       if (!Array.isArray(entries)) continue
       for (var i = 0; i < entries.length; i++) {
         var entry = entries[i]
-        var entryId = reg && typeof reg.barEntryId === "function"
-          ? reg.barEntryId(entry)
-          : (entry && typeof entry === "object" ? entry.id : entry)
+        var entryId = entry && typeof entry === "object" ? entry.id : entry
         if (String(entryId || "") === String(id))
           return {
             section: sections[s],
@@ -1301,73 +1343,128 @@ Panel {
   }
 
   function restoreBarSettings(id, state) {
-    var reg = root.registry
     var entry = state ? state.entry : null
-    if (!entry || !reg || typeof reg.setBarWidget !== "function") return
+    if (!entry) return
     var location = root.barStateFor(id)
     if (!location) return
-    var selector = { section: location.section, index: location.index }
+    var selector = JSON.stringify({ section: location.section, index: location.index })
     for (var key in entry) {
       if (key === "id") continue
-      var error = reg.setBarWidget(id, key, entry[key], selector)
-      if (error) console.warn("Could not restore " + id + " setting " + key + ": " + error)
+      root.shellIpc(["setBarWidget", String(id), String(key),
+        JSON.stringify(entry[key]), selector])
     }
   }
 
   function setPluginEnabled(id, value) {
-    var reg = root.registry
-    if (!reg || typeof reg.setEnabled !== "function") return
     // Bar options cannot be disabled directly (they are bar placements);
-    // guard here so a stale UI can't fight the registry.
+    // guard here so a stale UI can't fight the shell.
     for (var i = 0; i < root.pluginRows.length; i++) {
       var row = root.pluginRows[i]
       if (row.id === id && value === false && row.canDisable === false) return
     }
     var remembered = value ? root.rememberedBarStates[String(id)] : null
     var current = value ? null : root.barStateFor(id)
-    var changed = remembered
-      ? reg.setEnabled(id, true, remembered)
-      : reg.setEnabled(id, value)
-    if (!changed) return
+
+    // enablePlugin carries a placement, which plain setPluginEnabled cannot,
+    // so a widget returning to the bar goes back where it was.
+    if (value && remembered && remembered.entry) {
+      var placement = {
+        section: remembered.section,
+        index: remembered.index
+      }
+      root.shellIpc(["enablePlugin", String(id), JSON.stringify(placement)])
+    } else if (value) {
+      root.shellIpc(["enablePlugin", String(id), "{}"])
+    } else {
+      root.shellIpc(["setPluginEnabled", String(id), "false"])
+    }
+
     if (!value && current) root.rememberBarState(id, current)
-    else if (value && remembered) {
-      root.restoreBarSettings(id, remembered)
-      root.rememberBarState(id, null)
+    root.pendingRestore = (value && remembered) ? { id: String(id), state: remembered } : null
+  }
+
+  // enablePlugin and setBarWidget are separate IPC round trips, so settings can
+  // only be restored once the shell has actually put the widget back on the
+  // bar. applyInventory() drains this after the refresh that follows the call.
+  property var pendingRestore: null
+
+  function drainPendingRestore() {
+    var pending = root.pendingRestore
+    if (!pending) return
+    root.pendingRestore = null
+    root.restoreBarSettings(pending.id, pending.state)
+    root.rememberBarState(pending.id, null)
+  }
+
+  // Fire-and-forget call against the shell's `shell` IPC target. Every write
+  // the panel makes goes through here; reads go through plugin-inventory.sh.
+  property Process shellIpcProcess: Process {
+    onExited: function(exitCode) {
+      if (exitCode !== 0)
+        console.warn("omaplug: shell IPC call failed, exit code:", exitCode)
+      root.shellConfigFile.reload()
+      root.refreshPlugins()
     }
   }
 
+  function shellIpc(args) {
+    // The wrapper's default 2s IPC timeout is not reliably met while the shell
+    // is busy loading panels, and a timeout there reports failure for a call
+    // that did in fact land. Give it room rather than warn about phantom
+    // failures; the refresh that follows reports the real state either way.
+    var command = ["bash", "-c",
+      "OMARCHY_SHELL_IPC_TIMEOUT=10s exec omarchy-shell shell \"$@\"", "omaplug"]
+    for (var i = 0; i < args.length; i++) command.push(String(args[i]))
+    shellIpcProcess.command = command
+    shellIpcProcess.running = true
+  }
+
   function registryRevision() {
-    var reg = root.registry
-    return reg ? reg.registryRevision : 0
+    return root.inventoryRevision
   }
 
   function pluginEnabled(id) {
     root.registryRevision()
-    var reg = root.registry
-    var manifest = reg && reg.installedPlugins ? reg.installedPlugins[id] : null
-    if (!manifest) return false
-    var kinds = Array.isArray(manifest.kinds) ? manifest.kinds : []
-    // Built-in widgets remain loadable even while absent from the bar, so the
-    // user-facing toggle follows their actual placement instead of isEnabled().
-    return kinds.indexOf("bar-widget") !== -1 && typeof reg.inBar === "function"
-      ? reg.inBar(id) === true
-      : reg.isEnabled(id) === true
+    var m = root.inventory[String(id)]
+    if (!m) return false
+    // listPlugins already resolves this the way the toggle needs it: for a
+    // widget the reported `enabled` is its place in the bar, not whether its
+    // component is loadable (shell.qml listPlugins).
+    return m.enabled === true
   }
 
-  Connections {
-    target: root.registry
-    function onRegistryRevisionChanged() {
-      root.invalidateGlyphCache()
-    }
-    function onScanFinished() {
+  // shell.json holds the bar layout and disabledPlugins[], so every enable,
+  // disable, or placement change lands here — including ones made outside the
+  // panel with `omarchy plugin` or `omarchy bar`.
+  property alias shellConfigFile: shellConfigFileView
+  FileView {
+    id: shellConfigFileView
+    path: root.configHome + "/omarchy/shell.json"
+    watchChanges: true
+    printErrors: false
+    onFileChanged: {
+      shellConfigFileView.reload()
       root.refreshPlugins()
     }
+  }
+
+  readonly property string configHome: {
+    var home = root.pluginsDir.replace(/\/omarchy\/plugins$/, "")
+    return home
+  }
+
+  function shellConfig() {
+    var text = ""
+    try { text = shellConfigFileView.text() } catch (e) { return null }
+    if (!text) return null
+    try { return JSON.parse(text) } catch (e) { return null }
   }
 
   Component.onCompleted: {
     console.log("Panel.qml loaded, filterMode=", root.filterMode, "rows=", root.pluginRows.length)
     root.updateHelperPath = String(Qt.resolvedUrl("plugin-state.sh")).replace(/^file:\/\//, "")
     root.updateRunnerPath = String(Qt.resolvedUrl("update-helper.sh")).replace(/^file:\/\//, "")
+    root.inventoryHelperPath = String(Qt.resolvedUrl("plugin-inventory.sh")).replace(/^file:\/\//, "")
     refreshPlugins()
     fetchMarketplace()
     Qt.callLater(function() { updateStatusFile.reload() })
